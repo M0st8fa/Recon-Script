@@ -275,7 +275,7 @@ install_optional_tools() {
     install_go_tool "amass"        "github.com/owasp-amass/amass/v4/...@master"
 
     # Takeover
-    install_go_tool "subzy"        "github.com/PentestPanic/subzy@latest"
+    install_go_tool "subzy"        "github.com/PentestPad/subzy@latest"
 
     # Vulnerability Scanning
     install_go_tool "nuclei"       "github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest"
