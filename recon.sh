@@ -10,9 +10,9 @@ set -euo pipefail
 # ─────────────────────────────────────────────
 # COLORS
 # ─────────────────────────────────────────────
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-CYAN='\033[0;36m'; BLUE='\033[0;34m'; MAGENTA='\033[0;35m'
-BOLD='\033[1m'; RESET='\033[0m'
+RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'
+CYAN=$'\033[0;36m'; BLUE=$'\033[0;34m'; MAGENTA=$'\033[0;35m'
+BOLD=$'\033[1m'; RESET=$'\033[0m'
 
 # ─────────────────────────────────────────────
 # DEFAULTS
@@ -22,8 +22,8 @@ DOMAIN_LIST=""
 OUTPUT_DIR="recon_$(date +%Y%m%d_%H%M%S)"
 THREADS=50
 RATE_LIMIT=150          # httpx requests/sec
-RESOLVERS="/etc/resolv.conf"
-CUSTOM_RESOLVERS=""
+CUSTOM_RESOLVERS=""     # optional DNS resolvers file (-R), passed to dnsx
+RESOLVER_ARGS=()        # built from CUSTOM_RESOLVERS in parse_args
 DEPTH=3                 # katana crawl depth
 TIMEOUT=10
 SKIP_WAYBACK=false
@@ -32,9 +32,6 @@ SKIP_KATANA=false
 SKIP_SUBFINDER=false
 SKIP_HTTPX=false
 SKIP_ZONE_TRANSFER=false
-SKIP_SCREENSHOTS=false
-SKIP_NUCLEI=false
-SKIP_GITLEAKS=false
 RUN_NUCLEI=false
 RUN_SCREENSHOTS=false
 RUN_GITLEAKS=false
@@ -226,25 +223,37 @@ setup_dirs() {
 # ─────────────────────────────────────────────
 prepare_domains() {
     local alldomains="$OUTPUT_DIR/alldomains.txt"
+    local roots="$OUTPUT_DIR/root_domains.txt"
 
+    # Build the ORIGINAL scope (root domains) first. This is the source of
+    # truth used later to filter out-of-scope URLs (facebook.com, youtube.com,
+    # cdn providers, etc.) that crawlers pick up from external links. It is
+    # rebuilt from -d/-l every run so the scope always matches the arguments.
     if [[ -n "$DOMAIN" ]]; then
-        echo "$DOMAIN" > "$alldomains"
-        log "Target: $DOMAIN"
+        echo "$DOMAIN" > "$roots"
     elif [[ -n "$DOMAIN_LIST" ]]; then
-        cp "$DOMAIN_LIST" "$alldomains"
-        log "Loaded $(wc -l < "$alldomains") domains from $DOMAIN_LIST"
+        cp "$DOMAIN_LIST" "$roots"
     fi
 
-    # Sanitize: strip whitespace, remove blank lines, lowercase
-    sed -i 's/^[[:space:]]*//;s/[[:space:]]*$//;/^$/d' "$alldomains"
-    tr '[:upper:]' '[:lower:]' < "$alldomains" | sort -u > "${alldomains}.tmp"
-    mv "${alldomains}.tmp" "$alldomains"
+    # Sanitize: strip whitespace, remove blank lines, lowercase, dedupe
+    sed -i 's/^[[:space:]]*//;s/[[:space:]]*$//;/^$/d' "$roots"
+    tr '[:upper:]' '[:lower:]' < "$roots" | sort -u > "${roots}.tmp"
+    mv "${roots}.tmp" "$roots"
 
-    # Preserve the ORIGINAL scope (before subdomain enumeration appends
-    # discovered subs into alldomains.txt). This is the source of truth
-    # used later to filter out-of-scope URLs (facebook.com, youtube.com,
-    # cdn providers, etc.) that crawlers pick up from external links.
-    cp "$alldomains" "$OUTPUT_DIR/root_domains.txt"
+    # Working set. Subdomain enumeration appends discovered subs into
+    # alldomains.txt, so on --resume keep the accumulated list instead of
+    # resetting it back to the root scope.
+    if [[ "$RESUME" == true && -s "$alldomains" ]]; then
+        log "Resume: keeping existing $alldomains ($(wc -l < "$alldomains") entries)"
+    else
+        cp "$roots" "$alldomains"
+    fi
+
+    if [[ -n "$DOMAIN" ]]; then
+        log "Target: $DOMAIN"
+    else
+        log "Loaded $(wc -l < "$roots") domains from $DOMAIN_LIST"
+    fi
 }
 
 # Keep only URLs whose host is one of the root domains or a subdomain of one.
@@ -288,6 +297,11 @@ filter_in_scope() {
 zone_transfer_check() {
     [[ "$SKIP_ZONE_TRANSFER" == true ]] && return
     section "DNS Zone Transfer Check"
+
+    if [[ "$RESUME" == true && -s "$OUTPUT_DIR/dns/nameservers.txt" ]]; then
+        log "Resume: dns/nameservers.txt exists — skipping zone transfer / DNS recon"
+        return
+    fi
 
     local alldomains="$OUTPUT_DIR/alldomains.txt"
     local zt_out="$OUTPUT_DIR/dns/zone_transfers.txt"
@@ -382,6 +396,11 @@ subdomain_enum() {
     [[ "$SKIP_SUBFINDER" == true ]] && return
     section "Subdomain Enumeration"
 
+    if [[ "$RESUME" == true && -s "$OUTPUT_DIR/subdomains/all_subdomains.txt" ]]; then
+        log "Resume: subdomains/all_subdomains.txt exists — skipping subdomain enumeration"
+        return
+    fi
+
     local alldomains="$OUTPUT_DIR/alldomains.txt"
     local subfinder_out="$OUTPUT_DIR/subdomains/subfinder.txt"
     local dnsx_out="$OUTPUT_DIR/subdomains/dnsx_resolved.txt"
@@ -400,7 +419,7 @@ subdomain_enum() {
         # Generate permutations per domain
         while IFS= read -r domain; do
             awk -v d="$domain" '{print $1"."d}' "$WORDLIST" \
-            | dnsx -silent -a -resp -threads "$THREADS" \
+            | dnsx -silent -a -resp -threads "$THREADS" "${RESOLVER_ARGS[@]}" \
             >> "$brute_out" 2>/dev/null || true
         done < "$alldomains"
         log "Brute force: $(wc -l < "$brute_out" 2>/dev/null || echo 0) results"
@@ -415,17 +434,17 @@ subdomain_enum() {
     # Resolve with dnsx if available
     if command -v dnsx &>/dev/null; then
         info "Resolving subdomains with dnsx..."
-        dnsx -silent -l "$merged" -a -resp -threads "$THREADS" \
+        dnsx -silent -l "$merged" -a -resp -threads "$THREADS" "${RESOLVER_ARGS[@]}" \
             -o "$dnsx_out" 2>>"$OUTPUT_DIR/logs/dnsx.log" || true
 
         # Wildcard detection
-        dnsx -silent -l "$merged" -wc 2>/dev/null \
+        dnsx -silent -l "$merged" -wc "${RESOLVER_ARGS[@]}" 2>/dev/null \
             | tee "$OUTPUT_DIR/dns/wildcards.txt" || true
 
         # CNAME map across the full discovered scope — helps spot
         # subdomain takeover candidates pointing at unclaimed cloud resources
         info "Mapping CNAME records across full scope..."
-        dnsx -silent -l "$merged" -cname -resp-only -threads "$THREADS" \
+        dnsx -silent -l "$merged" -cname -resp-only -threads "$THREADS" "${RESOLVER_ARGS[@]}" \
             -o "$OUTPUT_DIR/subdomains/cname_map.txt" 2>>"$OUTPUT_DIR/logs/dnsx.log" || true
         local cname_cnt; cname_cnt=$(wc -l < "$OUTPUT_DIR/subdomains/cname_map.txt" 2>/dev/null || echo 0)
         [[ $cname_cnt -gt 0 ]] && log "CNAME records mapped: $cname_cnt"
@@ -457,6 +476,11 @@ subdomain_enum() {
 # ─────────────────────────────────────────────
 collect_urls() {
     section "URL Collection"
+
+    if [[ "$RESUME" == true && -s "$OUTPUT_DIR/urls/allurls.txt" ]]; then
+        log "Resume: urls/allurls.txt exists — skipping URL collection"
+        return
+    fi
 
     local alldomains="$OUTPUT_DIR/alldomains.txt"
     local allurls="$OUTPUT_DIR/urls/allurls.txt"
@@ -541,6 +565,11 @@ http_probe() {
     [[ "$SKIP_HTTPX" == true ]] && return
     section "HTTP Probing"
 
+    if [[ "$RESUME" == true && -s "$OUTPUT_DIR/httpx/httpx_all.txt" ]]; then
+        log "Resume: httpx/httpx_all.txt exists — skipping HTTP probing"
+        return
+    fi
+
     local allurls="$OUTPUT_DIR/urls/allurls.txt"
     local httpx_json="$OUTPUT_DIR/httpx/httpx_all.json"
     local httpx_all="$OUTPUT_DIR/httpx/httpx_all.txt"
@@ -600,6 +629,13 @@ http_probe() {
     jq -r '(.tech // .technologies // [])[]?' "$httpx_json" 2>/dev/null \
         | sort | uniq -c | sort -rn \
         > "$OUTPUT_DIR/httpx/tech_summary.txt" 2>/dev/null || true
+
+    # Web server (Server header) frequency summary — quick fingerprint of the
+    # stack across all live hosts. Built from httpx's existing JSON, so the
+    # httpx invocation and httpx_all.txt layout are unchanged.
+    jq -r '.webserver // empty' "$httpx_json" 2>/dev/null \
+        | sed '/^$/d' | sort | uniq -c | sort -rn \
+        > "$OUTPUT_DIR/httpx/server_summary.txt" 2>/dev/null || true
 
     # WordPress detection
     grep -aEoi 'https?://[^/]+/(wp-content|wp-includes|wp-admin)/?.*' \
@@ -1125,6 +1161,11 @@ $(cat "$OUTPUT_DIR/dns/cname_records.txt" 2>/dev/null | head -20 || echo "None r
 $(cat "$OUTPUT_DIR/subdomains/interesting_subs.txt" 2>/dev/null | head -20 || echo "None found")
 \`\`\`
 
+### Top Web Servers
+\`\`\`
+$(cat "$OUTPUT_DIR/httpx/server_summary.txt" 2>/dev/null | head -20 || echo "None recorded")
+\`\`\`
+
 ## Recommendations
 - Review all 403 URLs for bypass techniques
 - Test LFI parameter files manually
@@ -1195,6 +1236,15 @@ parse_args() {
     if [[ -n "$DOMAIN_LIST" && ! -f "$DOMAIN_LIST" ]]; then
         err "Domain list file not found: $DOMAIN_LIST"
         exit 1
+    fi
+    # Custom DNS resolvers (-R): fail clearly if the file is missing, then
+    # build the flag array passed to dnsx (empty when -R is not used).
+    if [[ -n "$CUSTOM_RESOLVERS" ]]; then
+        if [[ ! -f "$CUSTOM_RESOLVERS" ]]; then
+            err "Resolvers file not found: $CUSTOM_RESOLVERS"
+            exit 1
+        fi
+        RESOLVER_ARGS=(-r "$CUSTOM_RESOLVERS")
     fi
 }
 

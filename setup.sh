@@ -318,7 +318,7 @@ install_optional_tools() {
     install_go_tool "gowitness"    "github.com/sensepost/gowitness@latest"
 
     # Secrets
-    install_go_tool "gitleaks"     "github.com/zricethezav/gitleaks/v8@latest"
+    install_go_tool "gitleaks"     "github.com/gitleaks/gitleaks/v8@latest"
 
     # Extra PD tools
     install_go_tool "naabu"        "github.com/projectdiscovery/naabu/v2/cmd/naabu@latest"
@@ -341,8 +341,7 @@ install_optional_tools() {
     install_go_tool "puredns"      "github.com/d3mondev/puredns/v2@latest"
     install_go_tool "alterx"       "github.com/projectdiscovery/alterx/cmd/alterx@latest"
 
-    # Param discovery
-    install_go_tool "arjun"        "github.com/s0md3v/uro@latest"        # URL dedup
+    # Crawler (arjun is a Python tool — installed via pip in install_python_tools)
     install_go_tool "cariddi"      "github.com/edoardottt/cariddi/cmd/cariddi@latest"
 
     # Cloud
@@ -721,6 +720,7 @@ verify_tools() {
         "naabu" "tlsx" "gf" "assetfinder" "httprobe"
         "subzy" "puredns" "alterx" "notify" "cdncheck"
         "hakrawler" "qsreplace" "cariddi" "cloudlist"
+        "amass" "arjun"
     )
 
     local all_ok=true

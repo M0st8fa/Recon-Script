@@ -34,6 +34,10 @@ A modular, multi-phase recon automation script for bug hunters. It chains passiv
   - [7. Nuclei Scanning (opt-in)](#7-nuclei-scanning-opt-in)
   - [8. Screenshots (opt-in)](#8-screenshots-opt-in)
   - [9. Secret / Gitleaks Scanning (opt-in)](#9-secret--gitleaks-scanning-opt-in)
+  - [10. Parameter Guessing (opt-in)](#10-parameter-guessing-opt-in)
+  - [11. Port Scanning (opt-in)](#11-port-scanning-opt-in)
+  - [12. Open Redirect Testing (opt-in)](#12-open-redirect-testing-opt-in)
+  - [13. Active Checks (opt-in)](#13-active-checks-opt-in)
 - [Output Structure](#output-structure)
 - [Examples](#examples)
 - [Notifications](#notifications)
@@ -56,6 +60,9 @@ A modular, multi-phase recon automation script for bug hunters. It chains passiv
 | Vulnerability scanning | Nuclei — CVEs, exposed panels, default credentials (opt-in) |
 | Screenshots | gowitness / aquatone on live URLs (opt-in) |
 | Secret scanning | gitleaks + regex grep over downloaded JS/config files (opt-in) |
+| Parameter guessing | arjun finds hidden parameters per root domain (opt-in) |
+| Port scanning | naabu top-100 ports per host (opt-in) |
+| Active checks | Open-redirect verification, CORS misconfig, exposed `.git` (opt-in) |
 | Subdomain takeover | subzy integration if installed |
 | Notifications | Slack and Discord webhook support |
 | Markdown report | Auto-generated summary with findings and recommendations |
@@ -87,18 +94,28 @@ These extend the script's capabilities. The script will skip any module whose to
 
 | Tool | Module | Install |
 |---|---|---|
-| `dnsx` | DNS resolution + brute-force | `go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest` |
+| `jq` | Parses httpx JSON for status-code split and tech/server summaries | `apt install jq` |
+| `dnsx` | DNS resolution, brute-force, wildcard and CNAME mapping | `go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest` |
 | `gau` | Additional URLs from Common Crawl + OTX | `go install github.com/lc/gau/v2/cmd/gau@latest` |
-| `nuclei` | Vulnerability scanning | `go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest` |
-| `gowitness` | Screenshots of live URLs | `go install github.com/sensepost/gowitness@latest` |
-| `aquatone` | Screenshots (fallback to gowitness) | `go install github.com/michenriksen/aquatone@latest` |
-| `gitleaks` | Secret detection in JS/config files | `go install github.com/gitleaks/gitleaks/v8@latest` |
-| `subzy` | Subdomain takeover detection | `go install github.com/PentestPanic/subzy@latest` |
+| `nuclei` | Vulnerability scanning (`--nuclei`) | `go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest` |
+| `gowitness` | Screenshots of live URLs (`--screenshots`) | `go install github.com/sensepost/gowitness@latest` |
+| `aquatone` | Screenshots — manual fallback for gowitness; not installed by setup.sh | [releases](https://github.com/michenriksen/aquatone/releases) |
+| `gitleaks` | Secret detection in JS/config files (`--gitleaks`) | `go install github.com/gitleaks/gitleaks/v8@latest` |
+| `arjun` | Hidden parameter guessing (`--params`) | `pipx install arjun` |
+| `naabu` | Top-100 port scan per host (`--ports`) | `go install github.com/projectdiscovery/naabu/v2/cmd/naabu@latest` |
+| `qsreplace` | Swaps parameter values for open-redirect testing (`--test-redirects`) | `go install github.com/tomnomnom/qsreplace@latest` |
+| `subzy` | Subdomain takeover detection | `go install github.com/PentestPad/subzy@latest` |
 | `amass` | Additional subdomain enumeration | `go install github.com/owasp-amass/amass/v4/...@master` |
 
 ### Installation
 
-**Install all Go tools at once:**
+**Easiest — run the setup script** (installs Go, all required and optional tools, wordlists, and nuclei templates; safe to re-run):
+
+```bash
+bash setup.sh
+```
+
+**Or install the Go tools manually:**
 
 ```bash
 go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
@@ -113,7 +130,12 @@ go install github.com/lc/gau/v2/cmd/gau@latest
 go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
 go install github.com/sensepost/gowitness@latest
 go install github.com/gitleaks/gitleaks/v8@latest
-go install github.com/PentestPanic/subzy@latest
+go install github.com/projectdiscovery/naabu/v2/cmd/naabu@latest
+go install github.com/tomnomnom/qsreplace@latest
+go install github.com/PentestPad/subzy@latest
+
+# arjun is a Python tool (used by --params):
+pipx install arjun
 ```
 
 Make sure `$GOPATH/bin` (usually `~/go/bin`) is in your `$PATH`:
@@ -193,7 +215,7 @@ USAGE:
 | `-D` | `<num>` | `3` | Katana crawl depth |
 | `-T` | `<sec>` | `10` | Timeout in seconds for HTTP requests |
 | `-w` | `<wordlist>` | SecLists top-5000 | Custom DNS wordlist for brute-force |
-| `-R` | `<file>` | system resolvers | Custom DNS resolvers file (one IP per line) |
+| `-R` | `<file>` | system resolvers | Custom DNS resolvers file passed to `dnsx` (one IP per line); the script exits if the file is missing |
 
 #### Skip Modules (default: all ON)
 
@@ -213,7 +235,11 @@ USAGE:
 | `--nuclei` | Nuclei vulnerability scanning on live (200) URLs |
 | `--screenshots` | Visual screenshots via gowitness or aquatone |
 | `--gitleaks` | Secret scanning on downloaded JS and config files |
-| `--resume` | Resume a previous scan — continue into its existing output dir |
+| `--params` | Guess hidden parameters per root domain with `arjun` |
+| `--ports` | Scan the top 100 ports per host with `naabu` |
+| `--test-redirects` | Actively verify open-redirect parameters (uses `qsreplace` if present) |
+| `--active-checks` | CORS misconfiguration + exposed `.git` directory checks |
+| `--resume` | Resume into an existing `-o` dir — skips modules whose output already exists |
 
 #### Notifications
 
@@ -343,13 +369,16 @@ waybackurls + gau + katana + gospider
 Probes every collected URL with httpx to identify live endpoints, collect HTTP metadata, and detect technologies.
 
 **httpx flags used:**
+- `-json` — structured output; all other files are derived from it with `jq`
 - `-status-code` — HTTP response code
 - `-title` — page title
 - `-tech-detect` — technology fingerprinting (frameworks, servers, CMS)
 - `-content-length` — response body size
-- `-follow-redirects` — follow up to 10 redirects
-- `-threads` / `-rate-limit` — concurrency controls
-- `-no-color -silent` — clean output for parsing
+- `-follow-redirects` — follow redirects
+- `-threads` / `-rate-limit` / `-timeout` — concurrency and pacing controls
+- `-silent` — clean output for parsing
+
+If `jq` is not installed, the status-code split and the tech/server summaries are skipped and the raw JSON is copied to `httpx_all.txt` instead.
 
 **Output files:**
 
@@ -368,6 +397,7 @@ Probes every collected URL with httpx to identify live endpoints, collect HTTP m
 | `httpx/httpx503.txt` | Service unavailable |
 | `httpx/httpx_other.txt` | All other status codes |
 | `httpx/tech_summary.txt` | Technology frequency summary |
+| `httpx/server_summary.txt` | Web server (Server header) frequency summary |
 | `httpx/potential_wp_sites.txt` | WordPress installs detected |
 
 > **Tip:** `httpx403.txt` is gold. Many 403 pages are bypassable with path tricks, headers, or method overrides.
@@ -498,19 +528,87 @@ Downloads JavaScript and configuration files from `urls/js.txt` and scans them f
 
 ---
 
+### 10. Parameter Guessing (opt-in)
+
+**Flag:** `--params`
+**Output:** `params/`
+
+Runs `arjun` against each root domain to find hidden/unlinked parameters. Requires `arjun`; skipped with a warning if it is not installed.
+
+**Output files:**
+
+| File | Contents |
+|---|---|
+| `params/<domain>.txt` | Parameters found for each root domain |
+| `params/all_params.txt` | Merged unique parameter list |
+
+---
+
+### 11. Port Scanning (opt-in)
+
+**Flag:** `--ports`
+**Output:** `ports/`
+
+Scans the top 100 ports per host with `naabu`. Requires `naabu`; skipped with a warning if it is not installed.
+
+**Output files:**
+
+| File | Contents |
+|---|---|
+| `ports/open_ports.txt` | All `host:port` results |
+| `ports/<host>_ports.txt` | Open ports grouped per host |
+
+---
+
+### 12. Open Redirect Testing (opt-in)
+
+**Flag:** `--test-redirects`
+**Output:** `vuln/`
+
+Takes the URLs in `urls/redirect_ssrf.txt`, replaces each parameter value with a canary host, and follows the response. If the canary appears in the `Location` header, the redirect is confirmed. Uses `qsreplace` when present, otherwise falls back to a `sed` substitution.
+
+**Output files:**
+
+| File | Contents |
+|---|---|
+| `vuln/open_redirect_confirmed.txt` | Confirmed open redirects (original URL, test URL, Location header) |
+
+---
+
+### 13. Active Checks (opt-in)
+
+**Flag:** `--active-checks`
+**Output:** `vuln/`
+
+Two host-level checks:
+
+- **CORS misconfiguration** — sends a canary `Origin` to each unique live host and flags reflected origins and wildcard-plus-credentials responses.
+- **Exposed `.git`** — requests `/.git/config` over https then http for each domain and flags any `200` response.
+
+**Output files:**
+
+| File | Contents |
+|---|---|
+| `vuln/cors_misconfig.txt` | Reflected-origin and wildcard+credentials findings |
+| `vuln/git_exposure.txt` | Domains serving an exposed `.git/config` |
+
+---
+
 ## Output Structure
 
 Every run creates a timestamped directory (e.g. `recon_20240601_143022/`) with this layout:
 
 ```
 recon_TIMESTAMP/
-├── alldomains.txt              # Sanitized, deduplicated domain list
+├── alldomains.txt              # Working set: roots + discovered subdomains
+├── root_domains.txt            # Original scope (used for in-scope filtering)
 │
 ├── subdomains/
 │   ├── subfinder.txt           # Raw subfinder output
 │   ├── brute_force.txt         # DNS brute-force results
 │   ├── all_subdomains.txt      # Merged unique list
 │   ├── dnsx_resolved.txt       # Resolved with IPs
+│   ├── cname_map.txt           # CNAME map (takeover candidates)
 │   ├── interesting_subs.txt    # Keyword-filtered high-value subs
 │   └── zone_transfer_subs.txt  # From zone transfers
 │
@@ -537,6 +635,7 @@ recon_TIMESTAMP/
 │   ├── httpx403.txt
 │   ├── httpx401.txt
 │   ├── tech_summary.txt
+│   ├── server_summary.txt      # Server-header frequency
 │   └── potential_wp_sites.txt
 │
 ├── dns/
@@ -545,7 +644,10 @@ recon_TIMESTAMP/
 │   ├── txt_records.txt
 │   ├── dnssec_check.txt
 │   ├── mx_records.txt
+│   ├── cname_records.txt
+│   ├── ipv6.txt
 │   ├── wildcards.txt
+│   ├── s3_amazon.txt
 │   ├── cloud_storage_urls.txt
 │   └── cloud_storage_results.txt
 │
@@ -555,7 +657,16 @@ recon_TIMESTAMP/
 │   ├── nuclei_cves.txt
 │   ├── exposed_panels.txt
 │   ├── default_logins.txt
-│   └── subdomain_takeover.txt
+│   ├── subdomain_takeover.txt
+│   ├── open_redirect_confirmed.txt   # --test-redirects
+│   ├── cors_misconfig.txt            # --active-checks
+│   └── git_exposure.txt              # --active-checks
+│
+├── params/                     # --params (arjun)
+│   └── all_params.txt
+│
+├── ports/                      # --ports (naabu)
+│   └── open_ports.txt
 │
 ├── screenshots/                # gowitness / aquatone output
 │
@@ -585,16 +696,25 @@ recon_TIMESTAMP/
 ./recon.sh -d example.com
 ```
 
-**Full power — all modules enabled:**
+**Full power — all opt-in modules enabled:**
 ```bash
 ./recon.sh -d example.com \
     --nuclei \
     --screenshots \
     --gitleaks \
+    --params \
+    --ports \
+    --test-redirects \
+    --active-checks \
     -t 100 \
     -r 200 \
     -D 5 \
     -v
+```
+
+**Active verification extras only:**
+```bash
+./recon.sh -d example.com --params --ports --test-redirects --active-checks
 ```
 
 **Multiple domains from a file:**
