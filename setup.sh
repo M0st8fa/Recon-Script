@@ -37,8 +37,9 @@ SKIPPED=()
 # ─────────────────────────────────────────────
 log()     { echo -e "${GREEN}[+]${RESET} $*" | tee -a "$LOG_FILE"; }
 warn()    { echo -e "${YELLOW}[!]${RESET} $*" | tee -a "$LOG_FILE"; }
-err()     { echo -e "${RED}[-]${RESET} $*" | tee -a "$LOG_FILE"; ((ERRORS++)); }
+err()     { echo -e "${RED}[-]${RESET} $*" | tee -a "$LOG_FILE"; ERRORS=$((ERRORS+1)); }
 info()    { echo -e "${CYAN}[*]${RESET} $*" | tee -a "$LOG_FILE"; }
+verbose() { echo -e "${MAGENTA}[v]${RESET} $*" >> "$LOG_FILE"; }
 section() {
     echo -e "\n${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}" | tee -a "$LOG_FILE"
     echo -e "${BOLD}${BLUE}  $*${RESET}" | tee -a "$LOG_FILE"
@@ -137,8 +138,6 @@ install_system_packages() {
         openssl ca-certificates libssl-dev
         # Misc utils
         tree htop tmux screen vim nano
-        # Chromium (for gowitness screenshots)
-        chromium-browser chromium
         # Ruby (for some recon tools)
         ruby ruby-dev
         # File tools
@@ -155,15 +154,34 @@ install_system_packages() {
     done
 
     log "System packages done"
-}
 
-verbose() { echo -e "${MAGENTA}[v]${RESET} $*" >> "$LOG_FILE"; }
+    # Chromium for gowitness screenshots — try apt first, snap as fallback
+    if ! command -v chromium &>/dev/null && ! command -v chromium-browser &>/dev/null; then
+        info "Installing Chromium (needed by gowitness for screenshots)..."
+        if $SUDO apt-get install -y -qq chromium-browser >> "$LOG_FILE" 2>&1 \
+            || $SUDO apt-get install -y -qq chromium >> "$LOG_FILE" 2>&1; then
+            ok "chromium (apt)"
+        elif command -v snap &>/dev/null && $SUDO snap install chromium >> "$LOG_FILE" 2>&1; then
+            ok "chromium (snap)"
+        else
+            warn "Chromium install failed — gowitness screenshots will not work until installed manually"
+            warn "Try: sudo snap install chromium"
+        fi
+    else
+        skip "chromium"
+    fi
+}
 
 # ─────────────────────────────────────────────
 # GO LANGUAGE
 # ─────────────────────────────────────────────
 install_go() {
     section "Go Language ($GO_VERSION)"
+
+    # Always export PATH first so any pre-existing /usr/local/go is seen
+    export GOROOT="$GO_INSTALL_DIR/go"
+    export GOPATH="$GOPATH_DIR"
+    export PATH="$GOROOT/bin:$GOPATH/bin:$PATH"
 
     # Check if already installed and at correct version
     if command -v go &>/dev/null; then
@@ -193,7 +211,16 @@ install_go() {
 
     rm -f "/tmp/$GO_TARBALL"
     setup_go_env
-    ok "Go $GO_VERSION"
+
+    # Hard verification — this is what previously failed silently.
+    # Re-hash the shell's command lookup table and re-check explicitly.
+    hash -r 2>/dev/null || true
+    if [[ -x "$GOROOT/bin/go" ]]; then
+        ok "Go $($GOROOT/bin/go version | awk '{print $3}')"
+    else
+        fail "Go (binary not found at $GOROOT/bin/go after extraction)"
+        err "Manual fix: wget $GO_URL -O /tmp/go.tar.gz && sudo tar -C /usr/local -xzf /tmp/go.tar.gz"
+    fi
 }
 
 setup_go_env() {
@@ -228,14 +255,21 @@ export PATH=$GOROOT/bin:$GOPATH/bin:$PATH
 install_go_tool() {
     local name="$1"
     local module="$2"
+    local go_bin="${GOROOT:-/usr/local/go}/bin/go"
 
     if command -v "$name" &>/dev/null; then
         skip "$name"
         return
     fi
 
+    if [[ ! -x "$go_bin" ]]; then
+        fail "$name (go binary not found at $go_bin — run install_go first)"
+        return
+    fi
+
     info "Installing $name..."
-    if go install -v "$module" >> "$LOG_FILE" 2>&1; then
+    if GOPATH="$GOPATH_DIR" PATH="${GOROOT:-/usr/local/go}/bin:$GOPATH_DIR/bin:$PATH" \
+        "$go_bin" install -v "$module" >> "$LOG_FILE" 2>&1; then
         # Ensure binary is accessible
         if [[ -f "$GOPATH_DIR/bin/$name" ]]; then
             ok "$name"
@@ -284,7 +318,7 @@ install_optional_tools() {
     install_go_tool "gowitness"    "github.com/sensepost/gowitness@latest"
 
     # Secrets
-    install_go_tool "gitleaks"     "github.com/gitleaks/gitleaks/v8@latest"
+    install_go_tool "gitleaks"     "github.com/zricethezav/gitleaks/v8@latest"
 
     # Extra PD tools
     install_go_tool "naabu"        "github.com/projectdiscovery/naabu/v2/cmd/naabu@latest"
@@ -399,7 +433,8 @@ install_nuclei_templates() {
     fi
 
     info "Updating nuclei templates..."
-    nuclei -update-templates -silent >> "$LOG_FILE" 2>&1 || {
+    PATH="${GOROOT:-/usr/local/go}/bin:$GOPATH_DIR/bin:$PATH" \
+        nuclei -update-templates -silent >> "$LOG_FILE" 2>&1 || {
         warn "nuclei -update-templates failed, trying manual clone..."
         local templates_dir="$HOME/nuclei-templates"
         if [[ ! -d "$templates_dir" ]]; then
@@ -451,6 +486,15 @@ install_wordlists() {
     [[ -f "$web_common" ]] && ln -sf "$web_common"  "$WORDLISTS_DIR/web/common.txt"             2>/dev/null || true
     [[ -f "$web_raft" ]]   && ln -sf "$web_raft"    "$WORDLISTS_DIR/web/raft-large.txt"         2>/dev/null || true
     [[ -f "$params_list" ]]&& ln -sf "$params_list" "$WORDLISTS_DIR/params/burp-params.txt"     2>/dev/null || true
+
+    # Compatibility symlink — many tools (including older recon.sh defaults)
+    # expect SecLists at /usr/share/seclists. Point it at the real install
+    # so both paths resolve to the same data instead of silently mismatching.
+    if [[ -d "$seclists_dir" && ! -e /usr/share/seclists ]]; then
+        $SUDO ln -sf "$seclists_dir" /usr/share/seclists 2>/dev/null \
+            && log "Compat symlink: /usr/share/seclists -> $seclists_dir" \
+            || warn "Could not create /usr/share/seclists symlink (non-fatal)"
+    fi
 
     # Download high-quality DNS resolvers
     info "Downloading DNS resolvers list..."
@@ -754,6 +798,10 @@ main() {
     check_os
     install_system_packages
     install_go
+    hash -r 2>/dev/null || true
+    export GOROOT="${GOROOT:-/usr/local/go}"
+    export GOPATH="$GOPATH_DIR"
+    export PATH="$GOROOT/bin:$GOPATH/bin:$PATH"
     install_required_tools
     install_optional_tools
     install_python_tools
