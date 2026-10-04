@@ -38,12 +38,23 @@ SKIP_GITLEAKS=false
 RUN_NUCLEI=false
 RUN_SCREENSHOTS=false
 RUN_GITLEAKS=false
+RUN_PARAMS=false
+RUN_PORTS=false
+RUN_REDIRECT_TEST=false
+RUN_ACTIVE_CHECKS=false
 NOTIFY=false
 SLACK_WEBHOOK=""
 DISCORD_WEBHOOK=""
 VERBOSE=false
 RESUME=false
-WORDLIST="/usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt"
+WORDLIST="/opt/wordlists/dns/subdomains-top5000.txt"
+WORDLIST_FALLBACKS=(
+    "/opt/wordlists/dns/subdomains-top5000.txt"
+    "/opt/wordlists/SecLists/Discovery/DNS/subdomains-top1million-5000.txt"
+    "/usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt"
+    "/usr/share/wordlists/seclists/Discovery/DNS/subdomains-top1million-5000.txt"
+    "/usr/share/wordlists/SecLists/Discovery/DNS/subdomains-top1million-5000.txt"
+)
 NUCLEI_TEMPLATES="$HOME/nuclei-templates"
 USER_AGENT="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
 
@@ -103,6 +114,10 @@ ${BOLD}EXTRA MODULES (opt-in):${RESET}
   --screenshots         Take screenshots with gowitness/aquatone
   --nuclei              Run Nuclei vulnerability scanner
   --gitleaks            Run gitleaks on discovered JS/config files
+  --params              Guess hidden parameters per domain with arjun
+  --ports               Scan top 100 ports per host with naabu
+  --test-redirects      Actively verify open redirect parameters
+  --active-checks       CORS misconfiguration + exposed .git directory checks
   --resume              Resume from existing output directory
 
 ${BOLD}NOTIFICATIONS:${RESET}
@@ -114,6 +129,7 @@ ${BOLD}EXAMPLES:${RESET}
   $0 -l targets.txt -o my_recon -t 100 --nuclei --screenshots
   $0 -d example.com --skip-wayback --skip-gospider --nuclei
   $0 -d example.com --resume -o recon_20240601_120000
+  $0 -d example.com --test-redirects --active-checks --params --ports
 
 EOF
     exit 0
@@ -131,13 +147,29 @@ section() { echo -e "\n${BOLD}${BLUE}━━━━━━━━━━━━━━�
             echo -e "${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"; }
 verbose() { [[ "$VERBOSE" == true ]] && echo -e "${MAGENTA}[v]${RESET} $*" || true; }
 
+# Resolve the DNS wordlist path across known install locations.
+# Prevents silent brute-force skip when recon.sh's default doesn't match
+# wherever setup.sh (or the person) actually installed SecLists.
+resolve_wordlist() {
+    [[ -f "$WORDLIST" ]] && return 0
+    local candidate
+    for candidate in "${WORDLIST_FALLBACKS[@]}"; do
+        if [[ -f "$candidate" ]]; then
+            warn "Configured wordlist not found, using: $candidate"
+            WORDLIST="$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # ─────────────────────────────────────────────
 # TOOL CHECK
 # ─────────────────────────────────────────────
 check_tools() {
     section "Checking Required Tools"
     local required=(subfinder waybackurls katana gospider httpx anew unfurl dig)
-    local optional=(nuclei gowitness aquatone gitleaks dnsx amass)
+    local optional=(nuclei gowitness aquatone gitleaks dnsx amass jq naabu arjun qsreplace subzy)
     local missing_required=() missing_optional=()
 
     for tool in "${required[@]}"; do
@@ -207,6 +239,47 @@ prepare_domains() {
     sed -i 's/^[[:space:]]*//;s/[[:space:]]*$//;/^$/d' "$alldomains"
     tr '[:upper:]' '[:lower:]' < "$alldomains" | sort -u > "${alldomains}.tmp"
     mv "${alldomains}.tmp" "$alldomains"
+
+    # Preserve the ORIGINAL scope (before subdomain enumeration appends
+    # discovered subs into alldomains.txt). This is the source of truth
+    # used later to filter out-of-scope URLs (facebook.com, youtube.com,
+    # cdn providers, etc.) that crawlers pick up from external links.
+    cp "$alldomains" "$OUTPUT_DIR/root_domains.txt"
+}
+
+# Keep only URLs whose host is one of the root domains or a subdomain of one.
+# Strips out external links (social media, CDNs, unrelated third parties)
+# that Wayback/Katana/GoSpider pick up from <a href>, <script src>, etc.
+filter_in_scope() {
+    local infile="$1"
+    local outfile="$2"
+    local roots="$OUTPUT_DIR/root_domains.txt"
+
+    [[ -f "$infile" && -f "$roots" ]] || { cp "$infile" "$outfile" 2>/dev/null || true; return; }
+
+    awk -v rootsfile="$roots" '
+        BEGIN {
+            n = 0
+            while ((getline line < rootsfile) > 0) {
+                if (length(line) > 0) { n++; roots[n] = tolower(line) }
+            }
+            close(rootsfile)
+        }
+        {
+            url = $0
+            host = url
+            sub(/^[a-zA-Z]+:\/\//, "", host)   # strip scheme
+            sub(/\/.*/, "", host)              # strip path
+            sub(/:[0-9]+$/, "", host)          # strip port
+            host = tolower(host)
+            keep = 0
+            for (i = 1; i <= n; i++) {
+                r = roots[i]
+                if (host == r || host ~ ("\\." r "$")) { keep = 1; break }
+            }
+            if (keep) print url
+        }
+    ' "$infile" > "$outfile" 2>/dev/null || cp "$infile" "$outfile"
 }
 
 # ─────────────────────────────────────────────
@@ -229,7 +302,7 @@ zone_transfer_check() {
 
         # Get nameservers
         local nameservers
-        nameservers=$(dig NS "$domain" +short 2>/dev/null | sed 's/\.$//')
+        nameservers=$(timeout 10 dig +time=5 +tries=1 NS "$domain" +short 2>/dev/null | sed 's/\.$//')
 
         if [[ -z "$nameservers" ]]; then
             warn "No NS records found for $domain"
@@ -244,7 +317,7 @@ zone_transfer_check() {
             [[ -z "$ns" ]] && continue
             info "  Attempting AXFR: $ns -> $domain"
             local result
-            result=$(dig axfr "@$ns" "$domain" 2>/dev/null)
+            result=$(timeout 15 dig +time=5 +tries=1 axfr "@$ns" "$domain" 2>/dev/null || true)
 
             if echo "$result" | grep -qiE "^$domain\." ; then
                 warn "  ${RED}${BOLD}ZONE TRANSFER VULNERABLE!${RESET} $domain via $ns"
@@ -253,7 +326,7 @@ zone_transfer_check() {
                     echo "$result"
                     echo ""
                 } >> "$zt_out"
-                ((found++))
+                found=$((found+1))
                 # Extract subdomains from zone transfer
                 echo "$result" | grep -oP "[\w.-]+\.$domain" | sort -u \
                     >> "$OUTPUT_DIR/subdomains/zone_transfer_subs.txt" 2>/dev/null || true
@@ -264,12 +337,12 @@ zone_transfer_check() {
 
         # Also check for SPF, DMARC, DKIM misconfigs
         echo "=== TXT Records: $domain ===" >> "$OUTPUT_DIR/dns/txt_records.txt"
-        dig TXT "$domain" +short >> "$OUTPUT_DIR/dns/txt_records.txt" 2>/dev/null || true
-        dig TXT "_dmarc.$domain" +short >> "$OUTPUT_DIR/dns/txt_records.txt" 2>/dev/null || true
+        timeout 10 dig +time=5 +tries=1 TXT "$domain" +short >> "$OUTPUT_DIR/dns/txt_records.txt" 2>/dev/null || true
+        timeout 10 dig +time=5 +tries=1 TXT "_dmarc.$domain" +short >> "$OUTPUT_DIR/dns/txt_records.txt" 2>/dev/null || true
 
         # DNSSEC check
         local dnssec
-        dnssec=$(dig DS "$domain" +short 2>/dev/null)
+        dnssec=$(timeout 10 dig +time=5 +tries=1 DS "$domain" +short 2>/dev/null)
         if [[ -z "$dnssec" ]]; then
             echo "$domain: NO DNSSEC" >> "$OUTPUT_DIR/dns/dnssec_check.txt"
         else
@@ -277,11 +350,21 @@ zone_transfer_check() {
         fi
 
         # IPv6 (AAAA)
-        dig AAAA "$domain" +short >> "$OUTPUT_DIR/dns/ipv6.txt" 2>/dev/null || true
+        timeout 10 dig +time=5 +tries=1 AAAA "$domain" +short >> "$OUTPUT_DIR/dns/ipv6.txt" 2>/dev/null || true
 
         # MX records (useful for email security testing)
         echo "=== MX: $domain ===" >> "$OUTPUT_DIR/dns/mx_records.txt"
-        dig MX "$domain" +short >> "$OUTPUT_DIR/dns/mx_records.txt" 2>/dev/null || true
+        timeout 10 dig +time=5 +tries=1 MX "$domain" +short >> "$OUTPUT_DIR/dns/mx_records.txt" 2>/dev/null || true
+
+        # CNAME record — useful for spotting third-party dependencies
+        # (CDNs, SaaS platforms) and dangling-CNAME takeover candidates
+        local cname
+        cname=$(timeout 10 dig +time=5 +tries=1 CNAME "$domain" +short 2>/dev/null | sed 's/\.$//')
+        if [[ -n "$cname" ]]; then
+            echo "$domain -> $cname" >> "$OUTPUT_DIR/dns/cname_records.txt"
+        else
+            echo "$domain -> (no CNAME, A record only)" >> "$OUTPUT_DIR/dns/cname_records.txt"
+        fi
 
     done < "$alldomains"
 
@@ -311,8 +394,8 @@ subdomain_enum() {
     log "Subfinder: $(wc -l < "$subfinder_out" 2>/dev/null || echo 0) subdomains"
 
     # Optional DNS brute force if wordlist exists
-    if [[ -f "$WORDLIST" ]] && command -v dnsx &>/dev/null; then
-        info "DNS brute-force with dnsx..."
+    if resolve_wordlist && command -v dnsx &>/dev/null; then
+        info "DNS brute-force with dnsx (wordlist: $WORDLIST)..."
         local brute_out="$OUTPUT_DIR/subdomains/brute_force.txt"
         # Generate permutations per domain
         while IFS= read -r domain; do
@@ -321,6 +404,8 @@ subdomain_enum() {
             >> "$brute_out" 2>/dev/null || true
         done < "$alldomains"
         log "Brute force: $(wc -l < "$brute_out" 2>/dev/null || echo 0) results"
+    else
+        warn "No DNS wordlist found in any known location — skipping brute-force (see WORDLIST_FALLBACKS or pass -w)"
     fi
 
     # Merge all subdomains
@@ -336,6 +421,14 @@ subdomain_enum() {
         # Wildcard detection
         dnsx -silent -l "$merged" -wc 2>/dev/null \
             | tee "$OUTPUT_DIR/dns/wildcards.txt" || true
+
+        # CNAME map across the full discovered scope — helps spot
+        # subdomain takeover candidates pointing at unclaimed cloud resources
+        info "Mapping CNAME records across full scope..."
+        dnsx -silent -l "$merged" -cname -resp-only -threads "$THREADS" \
+            -o "$OUTPUT_DIR/subdomains/cname_map.txt" 2>>"$OUTPUT_DIR/logs/dnsx.log" || true
+        local cname_cnt; cname_cnt=$(wc -l < "$OUTPUT_DIR/subdomains/cname_map.txt" 2>/dev/null || echo 0)
+        [[ $cname_cnt -gt 0 ]] && log "CNAME records mapped: $cname_cnt"
     fi
 
     # Add resolved subdomains to alldomains for further scanning
@@ -422,11 +515,21 @@ collect_urls() {
     sort -u "$tmp_urls" \
         | grep -vE '\.(css|jpg|jpeg|png|gif|svg|ico|woff|woff2|ttf|eot|otf|map)($|\?)' \
         | grep -vE '^$' \
-        | anew "$allurls" > /dev/null
+        | anew "$OUTPUT_DIR/urls/.allurls_raw.txt" > /dev/null
 
-    log "Total unique URLs: ${BOLD}$(wc -l < "$allurls")${RESET}"
+    log "Total unique URLs (before scope filter): $(wc -l < "$OUTPUT_DIR/urls/.allurls_raw.txt" 2>/dev/null || echo 0)"
 
-    # Extract unique subdomains from URLs
+    # Drop out-of-scope URLs (facebook.com, youtube.com, cdn hosts, etc.)
+    # picked up from links embedded in crawled pages.
+    info "Filtering to in-scope domains/subdomains only..."
+    filter_in_scope "$OUTPUT_DIR/urls/.allurls_raw.txt" "$allurls"
+
+    local raw_count in_scope_count
+    raw_count=$(wc -l < "$OUTPUT_DIR/urls/.allurls_raw.txt" 2>/dev/null || echo 0)
+    in_scope_count=$(wc -l < "$allurls" 2>/dev/null || echo 0)
+    log "Total unique URLs: ${BOLD}$in_scope_count${RESET} (dropped $((raw_count - in_scope_count)) out-of-scope)"
+
+    # Extract unique subdomains from URLs (in-scope only, since allurls is now filtered)
     cat "$allurls" | unfurl -u domains 2>/dev/null \
         | anew "$OUTPUT_DIR/subdomains/all_subdomains.txt" > /dev/null || true
 }
@@ -439,10 +542,12 @@ http_probe() {
     section "HTTP Probing"
 
     local allurls="$OUTPUT_DIR/urls/allurls.txt"
+    local httpx_json="$OUTPUT_DIR/httpx/httpx_all.json"
     local httpx_all="$OUTPUT_DIR/httpx/httpx_all.txt"
 
     info "Running httpx on $(wc -l < "$allurls") URLs..."
     cat "$allurls" | httpx \
+        -json \
         -status-code \
         -title \
         -tech-detect \
@@ -451,32 +556,53 @@ http_probe() {
         -threads "$THREADS" \
         -rate-limit "$RATE_LIMIT" \
         -timeout "$TIMEOUT" \
-        -no-color \
         -silent \
-        -o "$httpx_all" \
+        -o "$httpx_json" \
         2>>"$OUTPUT_DIR/logs/httpx.log" || true
 
-    log "httpx probed: $(wc -l < "$httpx_all" 2>/dev/null || echo 0) responses"
+    local total
+    total=$(wc -l < "$httpx_json" 2>/dev/null || echo 0)
+    log "httpx probed: $total responses"
 
-    # Split by status code
+    if [[ ! -s "$httpx_json" ]]; then
+        warn "httpx returned no results"
+        return
+    fi
+
+    if ! command -v jq &>/dev/null; then
+        warn "jq not installed — status code split and tech summary will be skipped"
+        warn "Install with: sudo apt install jq"
+        cp "$httpx_json" "$httpx_all"
+        return
+    fi
+
+    # Human-readable line per URL, built from exact JSON fields (not bracket-string guessing)
+    jq -r 'select(.url != null) |
+        "\(.url) [\(.status_code // "-")] [\(.title // "-")] [\(((.tech // .technologies // []) | join(","))) ] [\(.content_length // "-")]"' \
+        "$httpx_json" > "$httpx_all" 2>/dev/null || true
+
+    # Split by EXACT status_code field — a URL with content-length 200 can never
+    # land in httpx200.txt now, unlike the old bracket-substring grep.
     local codes=(200 204 301 302 307 401 403 404 500 503)
     for code in "${codes[@]}"; do
-        grep "\[$code\]" "$httpx_all" | cut -d' ' -f1 \
+        jq -r --argjson c "$code" 'select(.status_code == $c) | .url' "$httpx_json" \
             > "$OUTPUT_DIR/httpx/httpx${code}.txt" 2>/dev/null || true
         local cnt; cnt=$(wc -l < "$OUTPUT_DIR/httpx/httpx${code}.txt" 2>/dev/null || echo 0)
         [[ $cnt -gt 0 ]] && log "  [$code]: $cnt URLs"
     done
 
-    # Everything else
-    grep -Ev '\[(200|204|301|302|307|401|403|404|500|503)\]' "$httpx_all" \
-        | cut -d' ' -f1 > "$OUTPUT_DIR/httpx/httpx_other.txt" 2>/dev/null || true
+    # Everything else — status codes not in our known list
+    jq -r --argjson known '[200,204,301,302,307,401,403,404,500,503]' \
+        'select(.status_code as $s | ($known | index($s)) == null) | .url' \
+        "$httpx_json" > "$OUTPUT_DIR/httpx/httpx_other.txt" 2>/dev/null || true
 
-    # Tech detection summary
-    grep -oP '\[([^\]]+)\]' "$httpx_all" | sort | uniq -c | sort -rn \
+    # Tech detection summary — real technology names only, no status/length noise
+    jq -r '(.tech // .technologies // [])[]?' "$httpx_json" 2>/dev/null \
+        | sort | uniq -c | sort -rn \
         > "$OUTPUT_DIR/httpx/tech_summary.txt" 2>/dev/null || true
 
     # WordPress detection
-    grep -Eoi 'https?://[^/]+/(wp-content|wp-includes|wp-admin)/?.*' \
+    grep -aEoi 'https?://[^/]+/(wp-content|wp-includes|wp-admin)/?.*' \
         "$OUTPUT_DIR/httpx/httpx200.txt" \
         > "$OUTPUT_DIR/httpx/potential_wp_sites.txt" 2>/dev/null || true
 }
@@ -501,39 +627,39 @@ classify_urls() {
         ["injection"]="="
         ["apis_all"]="api"
         ["api_docs_endpoints"]="swagger|api-docs|graphql|graphiql|/v[0-9]+/"
-        ["backups"]"\.(bak|old|backup|orig|save|swp)(\?|$)"
-        ["archives_dbs"]"\.(sql|zip|tar|tar\.gz|tgz|gz|rar|7z)$"
-        ["secrets"]"\.(env|ini|conf|cnf|pem|key|crt|pfx|p12)$"
-        ["data_configs"]"\.(json|xml|yaml|yml|toml)$"
-        ["logs"]"\.(log|out|err|war)$"
-        ["documents"]"\.(doc|docx|xls|xlsx|ppt|pptx|pdf|csv|odp|ods)$"
-        ["dev_scripts"]"\.(py|sh|bash|rb|pl|go)$"
-        ["lfi_params"]"(\?|&)(file|path|include|page|view|folder|inc|document|template)="
-        ["redirect_ssrf"]"(\?|&)(url|uri|link|dest|redirect|next|return|site|callback|webhook|host|domain|port|to|out)="
-        ["idor_params"]"(\?|&)(id|user|account|number|order|profile|key|token|uid|pid)="
-        ["admin_panels"]"/(admin|dashboard|panel|manage|cpanel|backend|control|superuser)"
-        ["dev_envs"]"(dev|test|stage|staging|uat|demo|sandbox|qa)"
-        ["sensitive_keywords"]"(internal|private|secret|backup|old|tmp|temp|hidden)"
-        ["ssrf_internal"]"(169\.254\.169\.254|localhost|127\.0\.0\.1|0\.0\.0\.0|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)"
-        ["xss_params"]"(\?|&)(q|s|search|query|keyword|lang|input|name|value|msg|message|error|debug|output)="
-        ["sqli_params"]"(\?|&)(id|cat|catid|item|product|num|page|year|month|day|sort|order)="
-        ["upload_params"]"(\?|&)(upload|file|attach|attachment|img|image|photo|avatar|thumb)="
-        ["debug_endpoints"]"/(debug|trace|info|status|health|ping|test|version|server-info|phpinfo)"
-        ["oauth_endpoints"]"/(oauth|callback|authorize|token|auth|login|logout|sso)"
-        ["aws_s3"]"(s3\.amazonaws\.com|\.s3\.amazonaws\.com|\.s3-)"
-        ["jwt_endpoints"]"(token|jwt|bearer|auth)"
+        ["backups"]="\.(bak|old|backup|orig|save|swp)(\?|$)"
+        ["archives_dbs"]="\.(sql|zip|tar|tar\.gz|tgz|gz|rar|7z)$"
+        ["secrets"]="\.(env|ini|conf|cnf|pem|key|crt|pfx|p12)$"
+        ["data_configs"]="\.(json|xml|yaml|yml|toml)$"
+        ["logs"]="\.(log|out|err|war)$"
+        ["documents"]="\.(doc|docx|xls|xlsx|ppt|pptx|pdf|csv|odp|ods)$"
+        ["dev_scripts"]="\.(py|sh|bash|rb|pl|go)$"
+        ["lfi_params"]="(\?|&)(file|path|include|page|view|folder|inc|document|template)="
+        ["redirect_ssrf"]="(\?|&)(url|uri|link|dest|redirect|next|return|site|callback|webhook|host|domain|port|to|out)="
+        ["idor_params"]="(\?|&)(id|user|account|number|order|profile|key|token|uid|pid)="
+        ["admin_panels"]="/(admin|dashboard|panel|manage|cpanel|backend|control|superuser)"
+        ["dev_envs"]="(dev|test|stage|staging|uat|demo|sandbox|qa)"
+        ["sensitive_keywords"]="(internal|private|secret|backup|old|tmp|temp|hidden)"
+        ["ssrf_internal"]="(169\.254\.169\.254|localhost|127\.0\.0\.1|0\.0\.0\.0|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)"
+        ["xss_params"]="(\?|&)(q|s|search|query|keyword|lang|input|name|value|msg|message|error|debug|output)="
+        ["sqli_params"]="(\?|&)(id|cat|catid|item|product|num|page|year|month|day|sort|order)="
+        ["upload_params"]="(\?|&)(upload|file|attach|attachment|img|image|photo|avatar|thumb)="
+        ["debug_endpoints"]="/(debug|trace|info|status|health|ping|test|version|server-info|phpinfo)"
+        ["oauth_endpoints"]="/(oauth|callback|authorize|token|auth|login|logout|sso)"
+        ["aws_s3"]="(s3\.amazonaws\.com|\.s3\.amazonaws\.com|\.s3-)"
+        ["jwt_endpoints"]="(token|jwt|bearer|auth)"
     )
 
     for name in "${!patterns[@]}"; do
-        grep -iEo "https?://[^ ]+" "$allurls" 2>/dev/null \
-            | grep -iE "${patterns[$name]}" \
+        grep -aiEo "https?://[^ ]+" "$allurls" 2>/dev/null \
+            | grep -aiE "${patterns[$name]}" \
             > "$u/${name}.txt" 2>/dev/null || true
         local cnt; cnt=$(wc -l < "$u/${name}.txt" 2>/dev/null || echo 0)
         [[ $cnt -gt 0 ]] && log "  $name: $cnt"
     done
 
     # Catch-all "others"
-    grep -viE 'config\.js|\.asp|\.txt|\.php|\.jspx?|\.aspx|\.js|=|api|\.bak$|\.old$|\.backup$|\.orig$|\.save$|\.swp$|\.sql$|\.zip$|\.tar(\.gz)?$|\.tgz$|\.gz$|\.rar$|\.7z$|\.env$|\.ini$|\.conf$|\.cnf$|\.pem$|\.key$|\.crt$|\.pfx$|\.p12$' \
+    grep -aviE 'config\.js|\.asp|\.txt|\.php|\.jspx?|\.aspx|\.js|=|api|\.bak$|\.old$|\.backup$|\.orig$|\.save$|\.swp$|\.sql$|\.zip$|\.tar(\.gz)?$|\.tgz$|\.gz$|\.rar$|\.7z$|\.env$|\.ini$|\.conf$|\.cnf$|\.pem$|\.key$|\.crt$|\.pfx$|\.p12$' \
         "$allurls" > "$u/others.txt" 2>/dev/null || true
 }
 
@@ -681,6 +807,199 @@ cloud_storage_check() {
 }
 
 # ─────────────────────────────────────────────
+# PARAMETER GUESSING
+# ─────────────────────────────────────────────
+guess_parameters() {
+    [[ "$RUN_PARAMS" == false ]] && return
+    ! command -v arjun &>/dev/null && { warn "arjun not installed, skipping parameter guessing"; return; }
+    section "Parameter Guessing"
+
+    local roots="$OUTPUT_DIR/root_domains.txt"
+    local params_dir="$OUTPUT_DIR/params"
+    mkdir -p "$params_dir"
+
+    while IFS= read -r domain; do
+        [[ -z "$domain" ]] && continue
+        info "Guessing parameters: $domain"
+        local outfile="$params_dir/${domain}.txt"
+        timeout 180 arjun -u "https://$domain/" -t 20 -oT "$outfile" --stable \
+            >> "$OUTPUT_DIR/logs/arjun.log" 2>&1 || true
+        if [[ -s "$outfile" ]]; then
+            local cnt; cnt=$(wc -l < "$outfile")
+            log "  $domain: $cnt parameter(s) found"
+        fi
+    done < "$roots"
+
+    cat "$params_dir"/*.txt 2>/dev/null | sort -u > "$params_dir/all_params.txt" || true
+    local total; total=$(wc -l < "$params_dir/all_params.txt" 2>/dev/null || echo 0)
+    log "Parameter guessing done: $total unique parameter(s) → $params_dir/"
+}
+
+# ─────────────────────────────────────────────
+# PORT SCANNING
+# ─────────────────────────────────────────────
+port_scan() {
+    [[ "$RUN_PORTS" == false ]] && return
+    ! command -v naabu &>/dev/null && { warn "naabu not installed, skipping port scan"; return; }
+    section "Port Scanning"
+
+    local alldomains="$OUTPUT_DIR/alldomains.txt"
+    local ports_dir="$OUTPUT_DIR/ports"
+    mkdir -p "$ports_dir"
+
+    info "Scanning top 100 ports across $(wc -l < "$alldomains") host(s)..."
+    naabu -list "$alldomains" \
+        -top-ports 100 \
+        -rate "$RATE_LIMIT" \
+        -c "$THREADS" \
+        -silent \
+        -o "$ports_dir/open_ports.txt" \
+        2>>"$OUTPUT_DIR/logs/naabu.log" || true
+
+    local cnt; cnt=$(wc -l < "$ports_dir/open_ports.txt" 2>/dev/null || echo 0)
+    log "Open ports found: $cnt"
+
+    # Group per host for readability
+    if [[ -s "$ports_dir/open_ports.txt" ]]; then
+        awk -F: '{print $1}' "$ports_dir/open_ports.txt" | sort -u \
+        | while read -r host; do
+            [[ -z "$host" ]] && continue
+            grep "^${host}:" "$ports_dir/open_ports.txt" > "$ports_dir/${host}_ports.txt" 2>/dev/null || true
+        done
+    fi
+}
+
+# ─────────────────────────────────────────────
+# ACTIVE OPEN REDIRECT TESTING
+# ─────────────────────────────────────────────
+test_open_redirects() {
+    [[ "$RUN_REDIRECT_TEST" == false ]] && return
+    section "Active Open Redirect Testing"
+
+    local infile="$OUTPUT_DIR/urls/redirect_ssrf.txt"
+    local outfile="$OUTPUT_DIR/vuln/open_redirect_confirmed.txt"
+    local payload_host="evil-recon-canary.test"
+    local payload="https://${payload_host}/"
+
+    mkdir -p "$OUTPUT_DIR/vuln"
+    > "$outfile"
+
+    if [[ ! -s "$infile" ]]; then
+        warn "No redirect/SSRF parameter URLs to test"
+        return
+    fi
+
+    local total; total=$(wc -l < "$infile")
+    info "Testing $total URL(s) for open redirect (payload host: $payload_host)..."
+
+    local count=0
+    while IFS= read -r url; do
+        [[ -z "$url" ]] && continue
+        count=$((count+1))
+
+        # Replace the parameter VALUE with our payload
+        local test_url=""
+        if command -v qsreplace &>/dev/null; then
+            test_url=$(echo "$url" | qsreplace "$payload" 2>/dev/null || true)
+        fi
+        if [[ -z "$test_url" ]]; then
+            test_url=$(echo "$url" | sed -E "s#(=)[^&]*#\1https://${payload_host}/#")
+        fi
+
+        local location
+        location=$(timeout 10 curl -sk -o /dev/null -D - --max-time 8 \
+            -A "$USER_AGENT" "$test_url" 2>/dev/null | grep -i "^location:" | head -1)
+
+        if echo "$location" | grep -qi "$payload_host"; then
+            warn "  OPEN REDIRECT: $url"
+            {
+                echo "URL      : $url"
+                echo "Test URL : $test_url"
+                echo "Location : $(echo "$location" | tr -d '\r')"
+                echo ""
+            } >> "$outfile"
+        fi
+    done < "$infile"
+
+    local found_count
+    found_count=$(grep -c "^URL" "$outfile" 2>/dev/null || echo 0)
+    if [[ "$found_count" -gt 0 ]]; then
+        warn "${BOLD}Open redirect CONFIRMED on $found_count URL(s)! → $outfile${RESET}"
+    else
+        log "No confirmed open redirects (tested $count URLs)"
+    fi
+}
+
+# ─────────────────────────────────────────────
+# ACTIVE CHECKS — CORS misconfig + .git exposure
+# ─────────────────────────────────────────────
+check_cors() {
+    local httpx200="$OUTPUT_DIR/httpx/httpx200.txt"
+    [[ -s "$httpx200" ]] || return
+    info "Testing CORS misconfiguration..."
+
+    local outfile="$OUTPUT_DIR/vuln/cors_misconfig.txt"
+    local canary="https://evil-recon-canary.test"
+    > "$outfile"
+
+    # Test once per unique scheme+host — CORS policy is host-level,
+    # so testing every path would be redundant and much slower.
+    local hosts_file
+    hosts_file="$(mktemp)"
+    awk -F/ '{print $1"//"$3}' "$httpx200" | sort -u > "$hosts_file"
+
+    info "Testing CORS on $(wc -l < "$hosts_file") unique host(s)..."
+
+    cat "$hosts_file" | xargs -P "$THREADS" -I HOST bash -c '
+        u="HOST"
+        headers=$(timeout 8 curl -sk -D - -o /dev/null --max-time 6 \
+            -H "Origin: '"$canary"'" -A "'"$USER_AGENT"'" "$u" 2>/dev/null)
+        acao=$(echo "$headers" | grep -i "^access-control-allow-origin:" | head -1)
+        acac=$(echo "$headers" | grep -i "^access-control-allow-credentials:" | head -1)
+        if echo "$acao" | grep -qi "'"$canary"'"; then
+            echo "REFLECTED ORIGIN: $u -> $acao" >> "'"$outfile"'"
+        fi
+        if echo "$acao" | grep -q "\*" && echo "$acac" | grep -qi "true"; then
+            echo "WILDCARD+CREDENTIALS: $u -> $acao / $acac" >> "'"$outfile"'"
+        fi
+    ' 2>/dev/null || true
+
+    rm -f "$hosts_file"
+    local cnt; cnt=$(wc -l < "$outfile" 2>/dev/null || echo 0)
+    [[ $cnt -gt 0 ]] && warn "CORS issues found: $cnt → $outfile" || log "No CORS issues found"
+}
+
+check_git_exposure() {
+    local alldomains="$OUTPUT_DIR/alldomains.txt"
+    local outfile="$OUTPUT_DIR/vuln/git_exposure.txt"
+    > "$outfile"
+    info "Checking for exposed .git directories..."
+
+    cat "$alldomains" | xargs -P "$THREADS" -I DOMAIN bash -c '
+        d="DOMAIN"
+        for scheme in https http; do
+            code=$(timeout 8 curl -sk -o /dev/null -w "%{http_code}" --max-time 6 \
+                "${scheme}://${d}/.git/config" 2>/dev/null || echo "000")
+            if [[ "$code" == "200" ]]; then
+                echo "${scheme}://${d}/.git/config [200]" >> "'"$outfile"'"
+                break
+            fi
+        done
+    ' 2>/dev/null || true
+
+    local cnt; cnt=$(wc -l < "$outfile" 2>/dev/null || echo 0)
+    [[ $cnt -gt 0 ]] && warn "${BOLD}.git exposure found: $cnt! → $outfile${RESET}" || log "No .git exposure found"
+}
+
+run_active_checks() {
+    [[ "$RUN_ACTIVE_CHECKS" == false ]] && return
+    section "Active Vulnerability Checks"
+    mkdir -p "$OUTPUT_DIR/vuln"
+    check_cors
+    check_git_exposure
+}
+
+# ─────────────────────────────────────────────
 # NOTIFICATIONS
 # ─────────────────────────────────────────────
 send_notification() {
@@ -743,6 +1062,11 @@ generate_report() {
 | Forbidden (403) | $live403 |
 | Zone transfers | $(wc -l < "$OUTPUT_DIR/dns/zone_transfers.txt" 2>/dev/null || echo 0) |
 | Nuclei findings | $(wc -l < "$OUTPUT_DIR/vuln/nuclei_results.txt" 2>/dev/null || echo 0) |
+| Open redirects confirmed | $(grep -c "^URL" "$OUTPUT_DIR/vuln/open_redirect_confirmed.txt" 2>/dev/null || echo 0) |
+| CORS issues | $(wc -l < "$OUTPUT_DIR/vuln/cors_misconfig.txt" 2>/dev/null || echo 0) |
+| .git exposures | $(wc -l < "$OUTPUT_DIR/vuln/git_exposure.txt" 2>/dev/null || echo 0) |
+| Open ports | $(wc -l < "$OUTPUT_DIR/ports/open_ports.txt" 2>/dev/null || echo 0) |
+| Parameters guessed | $(wc -l < "$OUTPUT_DIR/params/all_params.txt" 2>/dev/null || echo 0) |
 
 ## URL Classification
 | Category | Count |
@@ -776,6 +1100,26 @@ $(cat "$OUTPUT_DIR/urls/lfi_params.txt" 2>/dev/null | head -20 || echo "None fou
 $(cat "$OUTPUT_DIR/urls/redirect_ssrf.txt" 2>/dev/null | head -20 || echo "None found")
 \`\`\`
 
+### Confirmed Open Redirects
+\`\`\`
+$(cat "$OUTPUT_DIR/vuln/open_redirect_confirmed.txt" 2>/dev/null | head -30 || echo "None found (run with --test-redirects)")
+\`\`\`
+
+### CORS Misconfigurations
+\`\`\`
+$(cat "$OUTPUT_DIR/vuln/cors_misconfig.txt" 2>/dev/null | head -20 || echo "None found (run with --active-checks)")
+\`\`\`
+
+### Exposed .git Directories
+\`\`\`
+$(cat "$OUTPUT_DIR/vuln/git_exposure.txt" 2>/dev/null | head -20 || echo "None found (run with --active-checks)")
+\`\`\`
+
+### CNAME Records
+\`\`\`
+$(cat "$OUTPUT_DIR/dns/cname_records.txt" 2>/dev/null | head -20 || echo "None recorded")
+\`\`\`
+
 ### Interesting Subdomains
 \`\`\`
 $(cat "$OUTPUT_DIR/subdomains/interesting_subs.txt" 2>/dev/null | head -20 || echo "None found")
@@ -787,6 +1131,8 @@ $(cat "$OUTPUT_DIR/subdomains/interesting_subs.txt" 2>/dev/null | head -20 || ec
 - Check SSRF/redirect parameters
 - Manually verify nuclei findings
 - Review exposed admin panels
+- Investigate any confirmed open redirects for chaining into OAuth/token theft
+- Check CNAME records pointing to unclaimed cloud resources for takeover
 
 EOF
 
@@ -829,6 +1175,10 @@ parse_args() {
             --screenshots)        RUN_SCREENSHOTS=true; shift ;;
             --nuclei)             RUN_NUCLEI=true; shift ;;
             --gitleaks)           RUN_GITLEAKS=true; shift ;;
+            --params)             RUN_PARAMS=true; shift ;;
+            --ports)              RUN_PORTS=true; shift ;;
+            --test-redirects)     RUN_REDIRECT_TEST=true; shift ;;
+            --active-checks)      RUN_ACTIVE_CHECKS=true; shift ;;
             --resume)             RESUME=true; shift ;;
             --slack)              NOTIFY=true; SLACK_WEBHOOK="$2"; shift 2 ;;
             --discord)            NOTIFY=true; DISCORD_WEBHOOK="$2"; shift 2 ;;
@@ -864,6 +1214,10 @@ main() {
     http_probe
     classify_urls
     cloud_storage_check
+    guess_parameters
+    port_scan
+    test_open_redirects
+    run_active_checks
     run_nuclei
     run_screenshots
     run_gitleaks
