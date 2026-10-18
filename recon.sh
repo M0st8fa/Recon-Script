@@ -144,6 +144,12 @@ section() { echo -e "\n${BOLD}${BLUE}━━━━━━━━━━━━━━�
             echo -e "${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"; }
 verbose() { [[ "$VERBOSE" == true ]] && echo -e "${MAGENTA}[v]${RESET} $*" || true; }
 
+# Line count that never leaks a shell error. `wc -l < missing_file` makes the
+# shell print "No such file or directory" (the input redirection fails before
+# 2>/dev/null can apply), which spams report generation for every optional
+# module that wasn't run. Guard on existence first, so absent files report 0.
+count_lines() { if [[ -f "$1" ]]; then wc -l < "$1" 2>/dev/null; else echo 0; fi; }
+
 # Resolve the DNS wordlist path across known install locations.
 # Prevents silent brute-force skip when recon.sh's default doesn't match
 # wherever setup.sh (or the person) actually installed SecLists.
@@ -410,7 +416,7 @@ subdomain_enum() {
     subfinder -dL "$alldomains" -all --recursive \
         -o "$subfinder_out" \
         -silent 2>>"$OUTPUT_DIR/logs/subfinder.log" || true
-    log "Subfinder: $(wc -l < "$subfinder_out" 2>/dev/null || echo 0) subdomains"
+    log "Subfinder: $(count_lines "$subfinder_out") subdomains"
 
     # Optional DNS brute force if wordlist exists
     if resolve_wordlist && command -v dnsx &>/dev/null; then
@@ -422,7 +428,7 @@ subdomain_enum() {
             | dnsx -silent -a -resp -threads "$THREADS" "${RESOLVER_ARGS[@]}" \
             >> "$brute_out" 2>/dev/null || true
         done < "$alldomains"
-        log "Brute force: $(wc -l < "$brute_out" 2>/dev/null || echo 0) results"
+        log "Brute force: $(count_lines "$brute_out") results"
     else
         warn "No DNS wordlist found in any known location — skipping brute-force (see WORDLIST_FALLBACKS or pass -w)"
     fi
@@ -446,7 +452,7 @@ subdomain_enum() {
         info "Mapping CNAME records across full scope..."
         dnsx -silent -l "$merged" -cname -resp-only -threads "$THREADS" "${RESOLVER_ARGS[@]}" \
             -o "$OUTPUT_DIR/subdomains/cname_map.txt" 2>>"$OUTPUT_DIR/logs/dnsx.log" || true
-        local cname_cnt; cname_cnt=$(wc -l < "$OUTPUT_DIR/subdomains/cname_map.txt" 2>/dev/null || echo 0)
+        local cname_cnt; cname_cnt=$(count_lines "$OUTPUT_DIR/subdomains/cname_map.txt")
         [[ $cname_cnt -gt 0 ]] && log "CNAME records mapped: $cname_cnt"
     fi
 
@@ -493,7 +499,7 @@ collect_urls() {
         info "Fetching Wayback Machine URLs..."
         cat "$alldomains" | waybackurls 2>>"$OUTPUT_DIR/logs/wayback.log" \
             > "$OUTPUT_DIR/urls/waybackurls.txt" || true
-        log "Wayback: $(wc -l < "$OUTPUT_DIR/urls/waybackurls.txt" 2>/dev/null || echo 0) URLs"
+        log "Wayback: $(count_lines "$OUTPUT_DIR/urls/waybackurls.txt") URLs"
         cat "$OUTPUT_DIR/urls/waybackurls.txt" >> "$tmp_urls"
 
         # Also try Common Crawl via gau if available
@@ -502,7 +508,7 @@ collect_urls() {
             cat "$alldomains" | gau --threads "$THREADS" \
                 >> "$OUTPUT_DIR/urls/gau.txt" 2>/dev/null || true
             cat "$OUTPUT_DIR/urls/gau.txt" >> "$tmp_urls" 2>/dev/null || true
-            log "gau: $(wc -l < "$OUTPUT_DIR/urls/gau.txt" 2>/dev/null || echo 0) URLs"
+            log "gau: $(count_lines "$OUTPUT_DIR/urls/gau.txt") URLs"
         fi
     fi
 
@@ -517,7 +523,7 @@ collect_urls() {
             -c "$THREADS" \
             -o "$OUTPUT_DIR/urls/katana.txt" \
             2>>"$OUTPUT_DIR/logs/katana.log" || true
-        log "Katana: $(wc -l < "$OUTPUT_DIR/urls/katana.txt" 2>/dev/null || echo 0) URLs"
+        log "Katana: $(count_lines "$OUTPUT_DIR/urls/katana.txt") URLs"
         cat "$OUTPUT_DIR/urls/katana.txt" >> "$tmp_urls" 2>/dev/null || true
     fi
 
@@ -530,18 +536,23 @@ collect_urls() {
             2>>"$OUTPUT_DIR/logs/gospider.log" \
         | sed -n 's/.*\(https:\/\/[^ ]*\).*/\1/p' \
         >> "$OUTPUT_DIR/urls/gospider.txt" 2>/dev/null || true
-        log "GoSpider: $(wc -l < "$OUTPUT_DIR/urls/gospider.txt" 2>/dev/null || echo 0) URLs"
+        log "GoSpider: $(count_lines "$OUTPUT_DIR/urls/gospider.txt") URLs"
         cat "$OUTPUT_DIR/urls/gospider.txt" >> "$tmp_urls" 2>/dev/null || true
     fi
 
     # Merge & deduplicate — filter static assets
     info "Merging and deduplicating URLs..."
+    # The grep -v filters exit 1 when every line is filtered out (e.g. no URLs
+    # collected at all, or all crawlers skipped); with pipefail that would abort
+    # the whole run under set -e, so tolerate an empty/all-filtered pipeline.
     sort -u "$tmp_urls" \
         | grep -vE '\.(css|jpg|jpeg|png|gif|svg|ico|woff|woff2|ttf|eot|otf|map)($|\?)' \
         | grep -vE '^$' \
-        | anew "$OUTPUT_DIR/urls/.allurls_raw.txt" > /dev/null
+        | anew "$OUTPUT_DIR/urls/.allurls_raw.txt" > /dev/null || true
+    # Ensure the raw file always exists for the steps that read it next.
+    touch "$OUTPUT_DIR/urls/.allurls_raw.txt"
 
-    log "Total unique URLs (before scope filter): $(wc -l < "$OUTPUT_DIR/urls/.allurls_raw.txt" 2>/dev/null || echo 0)"
+    log "Total unique URLs (before scope filter): $(count_lines "$OUTPUT_DIR/urls/.allurls_raw.txt")"
 
     # Drop out-of-scope URLs (facebook.com, youtube.com, cdn hosts, etc.)
     # picked up from links embedded in crawled pages.
@@ -549,8 +560,8 @@ collect_urls() {
     filter_in_scope "$OUTPUT_DIR/urls/.allurls_raw.txt" "$allurls"
 
     local raw_count in_scope_count
-    raw_count=$(wc -l < "$OUTPUT_DIR/urls/.allurls_raw.txt" 2>/dev/null || echo 0)
-    in_scope_count=$(wc -l < "$allurls" 2>/dev/null || echo 0)
+    raw_count=$(count_lines "$OUTPUT_DIR/urls/.allurls_raw.txt")
+    in_scope_count=$(count_lines "$allurls")
     log "Total unique URLs: ${BOLD}$in_scope_count${RESET} (dropped $((raw_count - in_scope_count)) out-of-scope)"
 
     # Extract unique subdomains from URLs (in-scope only, since allurls is now filtered)
@@ -590,7 +601,7 @@ http_probe() {
         2>>"$OUTPUT_DIR/logs/httpx.log" || true
 
     local total
-    total=$(wc -l < "$httpx_json" 2>/dev/null || echo 0)
+    total=$(count_lines "$httpx_json")
     log "httpx probed: $total responses"
 
     if [[ ! -s "$httpx_json" ]]; then
@@ -616,7 +627,7 @@ http_probe() {
     for code in "${codes[@]}"; do
         jq -r --argjson c "$code" 'select(.status_code == $c) | .url' "$httpx_json" \
             > "$OUTPUT_DIR/httpx/httpx${code}.txt" 2>/dev/null || true
-        local cnt; cnt=$(wc -l < "$OUTPUT_DIR/httpx/httpx${code}.txt" 2>/dev/null || echo 0)
+        local cnt; cnt=$(count_lines "$OUTPUT_DIR/httpx/httpx${code}.txt")
         [[ $cnt -gt 0 ]] && log "  [$code]: $cnt URLs"
     done
 
@@ -690,7 +701,7 @@ classify_urls() {
         grep -aiEo "https?://[^ ]+" "$allurls" 2>/dev/null \
             | grep -aiE "${patterns[$name]}" \
             > "$u/${name}.txt" 2>/dev/null || true
-        local cnt; cnt=$(wc -l < "$u/${name}.txt" 2>/dev/null || echo 0)
+        local cnt; cnt=$(count_lines "$u/${name}.txt")
         [[ $cnt -gt 0 ]] && log "  $name: $cnt"
     done
 
@@ -714,7 +725,7 @@ run_nuclei() {
     info "Updating nuclei templates..."
     nuclei -update-templates -silent 2>/dev/null || true
 
-    info "Running nuclei on $(wc -l < "$httpx200" 2>/dev/null || echo 0) live URLs..."
+    info "Running nuclei on $(count_lines "$httpx200") live URLs..."
     nuclei -l "$httpx200" \
         -t "$NUCLEI_TEMPLATES" \
         -severity critical,high,medium \
@@ -728,8 +739,8 @@ run_nuclei() {
     # Separate critical/high
     grep -iE "critical|high" "$nuclei_out" > "$nuclei_critical" 2>/dev/null || true
 
-    log "Nuclei findings: $(wc -l < "$nuclei_out" 2>/dev/null || echo 0)"
-    log "Critical/High: $(wc -l < "$nuclei_critical" 2>/dev/null || echo 0)"
+    log "Nuclei findings: $(count_lines "$nuclei_out")"
+    log "Critical/High: $(count_lines "$nuclei_critical")"
 
     # Run specific checks
     # CVE checks only
@@ -867,7 +878,7 @@ guess_parameters() {
     done < "$roots"
 
     cat "$params_dir"/*.txt 2>/dev/null | sort -u > "$params_dir/all_params.txt" || true
-    local total; total=$(wc -l < "$params_dir/all_params.txt" 2>/dev/null || echo 0)
+    local total; total=$(count_lines "$params_dir/all_params.txt")
     log "Parameter guessing done: $total unique parameter(s) → $params_dir/"
 }
 
@@ -892,7 +903,7 @@ port_scan() {
         -o "$ports_dir/open_ports.txt" \
         2>>"$OUTPUT_DIR/logs/naabu.log" || true
 
-    local cnt; cnt=$(wc -l < "$ports_dir/open_ports.txt" 2>/dev/null || echo 0)
+    local cnt; cnt=$(count_lines "$ports_dir/open_ports.txt")
     log "Open ports found: $cnt"
 
     # Group per host for readability
@@ -958,7 +969,9 @@ test_open_redirects() {
     done < "$infile"
 
     local found_count
-    found_count=$(grep -c "^URL" "$outfile" 2>/dev/null || echo 0)
+    # grep -c prints its own "0" on no match (exit 1); only fall back to 0 when
+    # the command itself fails, otherwise we get "0\n0" and a [[ -gt ]] error.
+    found_count=$(grep -c "^URL" "$outfile" 2>/dev/null) || found_count=0
     if [[ "$found_count" -gt 0 ]]; then
         warn "${BOLD}Open redirect CONFIRMED on $found_count URL(s)! → $outfile${RESET}"
     else
@@ -1001,7 +1014,7 @@ check_cors() {
     ' 2>/dev/null || true
 
     rm -f "$hosts_file"
-    local cnt; cnt=$(wc -l < "$outfile" 2>/dev/null || echo 0)
+    local cnt; cnt=$(count_lines "$outfile")
     [[ $cnt -gt 0 ]] && warn "CORS issues found: $cnt → $outfile" || log "No CORS issues found"
 }
 
@@ -1023,7 +1036,7 @@ check_git_exposure() {
         done
     ' 2>/dev/null || true
 
-    local cnt; cnt=$(wc -l < "$outfile" 2>/dev/null || echo 0)
+    local cnt; cnt=$(count_lines "$outfile")
     [[ $cnt -gt 0 ]] && warn "${BOLD}.git exposure found: $cnt! → $outfile${RESET}" || log "No .git exposure found"
 }
 
@@ -1042,10 +1055,10 @@ send_notification() {
     [[ "$NOTIFY" == false ]] && return
 
     local total_subs total_urls total_httpx200 total_vulns
-    total_subs=$(wc -l < "$OUTPUT_DIR/subdomains/all_subdomains.txt" 2>/dev/null || echo 0)
-    total_urls=$(wc -l < "$OUTPUT_DIR/urls/allurls.txt" 2>/dev/null || echo 0)
-    total_httpx200=$(wc -l < "$OUTPUT_DIR/httpx/httpx200.txt" 2>/dev/null || echo 0)
-    total_vulns=$(wc -l < "$OUTPUT_DIR/vuln/nuclei_results.txt" 2>/dev/null || echo 0)
+    total_subs=$(count_lines "$OUTPUT_DIR/subdomains/all_subdomains.txt")
+    total_urls=$(count_lines "$OUTPUT_DIR/urls/allurls.txt")
+    total_httpx200=$(count_lines "$OUTPUT_DIR/httpx/httpx200.txt")
+    total_vulns=$(count_lines "$OUTPUT_DIR/vuln/nuclei_results.txt")
 
     local msg="🔍 *Recon Complete*
 Target: ${DOMAIN:-$DOMAIN_LIST}
@@ -1075,12 +1088,15 @@ generate_report() {
     section "Generating Summary Report"
 
     local report="$OUTPUT_DIR/reports/summary.md"
-    local total_subs total_urls live200 live403
+    local total_subs total_urls live200 live403 redirect_confirmed
 
-    total_subs=$(wc -l < "$OUTPUT_DIR/subdomains/all_subdomains.txt" 2>/dev/null || echo 0)
-    total_urls=$(wc -l < "$OUTPUT_DIR/urls/allurls.txt" 2>/dev/null || echo 0)
-    live200=$(wc -l < "$OUTPUT_DIR/httpx/httpx200.txt" 2>/dev/null || echo 0)
-    live403=$(wc -l < "$OUTPUT_DIR/httpx/httpx403.txt" 2>/dev/null || echo 0)
+    total_subs=$(count_lines "$OUTPUT_DIR/subdomains/all_subdomains.txt")
+    total_urls=$(count_lines "$OUTPUT_DIR/urls/allurls.txt")
+    live200=$(count_lines "$OUTPUT_DIR/httpx/httpx200.txt")
+    live403=$(count_lines "$OUTPUT_DIR/httpx/httpx403.txt")
+    # grep -c emits its own "0" on no match; only default to 0 when it errors,
+    # so the table cell stays a single integer instead of "0\n0".
+    redirect_confirmed=$(grep -c "^URL" "$OUTPUT_DIR/vuln/open_redirect_confirmed.txt" 2>/dev/null) || redirect_confirmed=0
 
     cat > "$report" <<EOF
 # Recon Report — $(date)
@@ -1096,13 +1112,13 @@ generate_report() {
 | Total unique URLs | $total_urls |
 | Live URLs (200) | $live200 |
 | Forbidden (403) | $live403 |
-| Zone transfers | $(wc -l < "$OUTPUT_DIR/dns/zone_transfers.txt" 2>/dev/null || echo 0) |
-| Nuclei findings | $(wc -l < "$OUTPUT_DIR/vuln/nuclei_results.txt" 2>/dev/null || echo 0) |
-| Open redirects confirmed | $(grep -c "^URL" "$OUTPUT_DIR/vuln/open_redirect_confirmed.txt" 2>/dev/null || echo 0) |
-| CORS issues | $(wc -l < "$OUTPUT_DIR/vuln/cors_misconfig.txt" 2>/dev/null || echo 0) |
-| .git exposures | $(wc -l < "$OUTPUT_DIR/vuln/git_exposure.txt" 2>/dev/null || echo 0) |
-| Open ports | $(wc -l < "$OUTPUT_DIR/ports/open_ports.txt" 2>/dev/null || echo 0) |
-| Parameters guessed | $(wc -l < "$OUTPUT_DIR/params/all_params.txt" 2>/dev/null || echo 0) |
+| Zone transfers | $(count_lines "$OUTPUT_DIR/dns/zone_transfers.txt") |
+| Nuclei findings | $(count_lines "$OUTPUT_DIR/vuln/nuclei_results.txt") |
+| Open redirects confirmed | $redirect_confirmed |
+| CORS issues | $(count_lines "$OUTPUT_DIR/vuln/cors_misconfig.txt") |
+| .git exposures | $(count_lines "$OUTPUT_DIR/vuln/git_exposure.txt") |
+| Open ports | $(count_lines "$OUTPUT_DIR/ports/open_ports.txt") |
+| Parameters guessed | $(count_lines "$OUTPUT_DIR/params/all_params.txt") |
 
 ## URL Classification
 | Category | Count |
@@ -1114,7 +1130,7 @@ EOF
         [[ "$f" == *allurls* ]] && continue
         local name count
         name=$(basename "$f" .txt)
-        count=$(wc -l < "$f" 2>/dev/null || echo 0)
+        count=$(count_lines "$f")
         [[ $count -gt 0 ]] && echo "| $name | $count |" >> "$report"
     done
 
