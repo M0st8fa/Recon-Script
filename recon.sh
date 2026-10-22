@@ -135,14 +135,55 @@ EOF
 # ─────────────────────────────────────────────
 # LOGGING
 # ─────────────────────────────────────────────
-log()     { echo -e "${GREEN}[+]${RESET} $*"; }
-warn()    { echo -e "${YELLOW}[!]${RESET} $*"; }
-err()     { echo -e "${RED}[-]${RESET} $*" >&2; }
-info()    { echo -e "${CYAN}[*]${RESET} $*"; }
+# Consolidated run log, capped at 1 MB. Every log line is mirrored here
+# (ANSI stripped) so a run leaves one readable recon.log, while the cap keeps
+# the file from growing without bound on long crawls. Rotation is in-place:
+# once the file passes 1 MB we keep only its most recent 1 MB, so recon.log
+# never exceeds the cap and no .1/.2 copies accumulate.
+MAX_LOG_BYTES=1048576      # 1 MB
+_log_sink() {
+    [[ -d "$OUTPUT_DIR" ]] || return 0          # output dir not created yet
+    local f="$OUTPUT_DIR/recon.log"
+    printf '%s %s\n' "$(date +%H:%M:%S)" "$1" \
+        | sed -r 's/\x1b\[[0-9;]*m//g' >> "$f" 2>/dev/null || return 0
+    local sz; sz=$(wc -c < "$f" 2>/dev/null || echo 0)
+    if (( sz > MAX_LOG_BYTES )); then
+        tail -c "$MAX_LOG_BYTES" "$f" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f" 2>/dev/null
+    fi
+}
+
+log()     { echo -e "${GREEN}[+]${RESET} $*"; _log_sink "[+] $*"; }
+warn()    { echo -e "${YELLOW}[!]${RESET} $*"; _log_sink "[!] $*"; }
+err()     { echo -e "${RED}[-]${RESET} $*" >&2; _log_sink "[-] $*"; }
+info()    { echo -e "${CYAN}[*]${RESET} $*"; _log_sink "[*] $*"; }
 section() { echo -e "\n${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"; \
             echo -e "${BOLD}${BLUE}  $*${RESET}"; \
-            echo -e "${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"; }
-verbose() { [[ "$VERBOSE" == true ]] && echo -e "${MAGENTA}[v]${RESET} $*" || true; }
+            echo -e "${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"; \
+            _log_sink "=== $* ==="; }
+verbose() { [[ "$VERBOSE" == true ]] && { echo -e "${MAGENTA}[v]${RESET} $*"; _log_sink "[v] $*"; } || true; }
+
+# Streaming 1 MB capper for a per-tool log file. Route a tool's output through
+# it with:  2> >(_logcap "$OUTPUT_DIR/logs/<tool>.log")  so the file on disk
+# never exceeds MAX_LOG_BYTES at any instant — only the most recent 1 MB of the
+# stream is kept (in a byte-bounded in-memory ring); older output is discarded,
+# never written. flush() every 200 lines only bounds disk-write churn; memory
+# is trimmed on every line, so the file stays <= 1 MB at all times.
+_logcap() {
+    awk -v cap="$MAX_LOG_BYTES" -v out="$1" '
+        function flush(   i) {
+            printf "" > out                 # truncate (reopened after close)
+            for (i = lo; i <= hi; i++) print buf[i] > out
+            close(out)
+        }
+        BEGIN { lo = 1; hi = 0; bytes = 0; since = 0 }
+        {
+            buf[++hi] = $0; bytes += length($0) + 1
+            while (bytes > cap && lo < hi) { bytes -= length(buf[lo]) + 1; delete buf[lo]; lo++ }
+            if (++since >= 200) { flush(); since = 0 }   # bound disk-write churn
+        }
+        END { flush() }
+    '
+}
 
 # Line count that never leaks a shell error. `wc -l < missing_file` makes the
 # shell print "No such file or directory" (the input redirection fails before
@@ -415,7 +456,7 @@ subdomain_enum() {
     info "Running subfinder (passive + all sources)..."
     subfinder -dL "$alldomains" -all --recursive \
         -o "$subfinder_out" \
-        -silent 2>>"$OUTPUT_DIR/logs/subfinder.log" || true
+        -silent 2> >(_logcap "$OUTPUT_DIR/logs/subfinder.log") || true
     log "Subfinder: $(count_lines "$subfinder_out") subdomains"
 
     # Optional DNS brute force if wordlist exists
@@ -441,7 +482,7 @@ subdomain_enum() {
     if command -v dnsx &>/dev/null; then
         info "Resolving subdomains with dnsx..."
         dnsx -silent -l "$merged" -a -resp -threads "$THREADS" "${RESOLVER_ARGS[@]}" \
-            -o "$dnsx_out" 2>>"$OUTPUT_DIR/logs/dnsx.log" || true
+            -o "$dnsx_out" 2> >(_logcap "$OUTPUT_DIR/logs/dnsx.log") || true
 
         # Wildcard detection
         dnsx -silent -l "$merged" -wc "${RESOLVER_ARGS[@]}" 2>/dev/null \
@@ -451,7 +492,7 @@ subdomain_enum() {
         # subdomain takeover candidates pointing at unclaimed cloud resources
         info "Mapping CNAME records across full scope..."
         dnsx -silent -l "$merged" -cname -resp-only -threads "$THREADS" "${RESOLVER_ARGS[@]}" \
-            -o "$OUTPUT_DIR/subdomains/cname_map.txt" 2>>"$OUTPUT_DIR/logs/dnsx.log" || true
+            -o "$OUTPUT_DIR/subdomains/cname_map.txt" 2> >(_logcap "$OUTPUT_DIR/logs/dnsx.log") || true
         local cname_cnt; cname_cnt=$(count_lines "$OUTPUT_DIR/subdomains/cname_map.txt")
         [[ $cname_cnt -gt 0 ]] && log "CNAME records mapped: $cname_cnt"
     fi
@@ -497,7 +538,7 @@ collect_urls() {
     # Waybackurls
     if [[ "$SKIP_WAYBACK" == false ]]; then
         info "Fetching Wayback Machine URLs..."
-        cat "$alldomains" | waybackurls 2>>"$OUTPUT_DIR/logs/wayback.log" \
+        cat "$alldomains" | waybackurls 2> >(_logcap "$OUTPUT_DIR/logs/wayback.log") \
             > "$OUTPUT_DIR/urls/waybackurls.txt" || true
         log "Wayback: $(count_lines "$OUTPUT_DIR/urls/waybackurls.txt") URLs"
         cat "$OUTPUT_DIR/urls/waybackurls.txt" >> "$tmp_urls"
@@ -519,10 +560,11 @@ collect_urls() {
             -d "$DEPTH" \
             -jc \
             -kf all \
+            -fsu \
             -silent \
             -c "$THREADS" \
             -o "$OUTPUT_DIR/urls/katana.txt" \
-            2>>"$OUTPUT_DIR/logs/katana.log" || true
+            2> >(_logcap "$OUTPUT_DIR/logs/katana.log") || true
         log "Katana: $(count_lines "$OUTPUT_DIR/urls/katana.txt") URLs"
         cat "$OUTPUT_DIR/urls/katana.txt" >> "$tmp_urls" 2>/dev/null || true
     fi
@@ -533,7 +575,7 @@ collect_urls() {
         sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s|^|https://|' "$alldomains" \
         | gospider -S - -t "$THREADS" --depth "$DEPTH" \
             --user-agent "$USER_AGENT" \
-            2>>"$OUTPUT_DIR/logs/gospider.log" \
+            2> >(_logcap "$OUTPUT_DIR/logs/gospider.log") \
         | sed -n 's/.*\(https:\/\/[^ ]*\).*/\1/p' \
         >> "$OUTPUT_DIR/urls/gospider.txt" 2>/dev/null || true
         log "GoSpider: $(count_lines "$OUTPUT_DIR/urls/gospider.txt") URLs"
@@ -598,7 +640,7 @@ http_probe() {
         -timeout "$TIMEOUT" \
         -silent \
         -o "$httpx_json" \
-        2>>"$OUTPUT_DIR/logs/httpx.log" || true
+        2> >(_logcap "$OUTPUT_DIR/logs/httpx.log") || true
 
     local total
     total=$(count_lines "$httpx_json")
@@ -734,7 +776,7 @@ run_nuclei() {
         -timeout "$TIMEOUT" \
         -silent \
         -o "$nuclei_out" \
-        2>>"$OUTPUT_DIR/logs/nuclei.log" || true
+        2> >(_logcap "$OUTPUT_DIR/logs/nuclei.log") || true
 
     # Separate critical/high
     grep -iE "critical|high" "$nuclei_out" > "$nuclei_critical" 2>/dev/null || true
@@ -770,14 +812,14 @@ run_screenshots() {
         gowitness file -f "$httpx200" \
             --screenshot-path "$OUTPUT_DIR/screenshots/" \
             --threads "$THREADS" \
-            2>>"$OUTPUT_DIR/logs/gowitness.log" || true
+            2> >(_logcap "$OUTPUT_DIR/logs/gowitness.log") || true
         log "Screenshots saved to $OUTPUT_DIR/screenshots/"
     elif command -v aquatone &>/dev/null; then
         info "Taking screenshots with aquatone..."
         cat "$httpx200" | aquatone \
             -out "$OUTPUT_DIR/screenshots/" \
             -threads "$THREADS" \
-            2>>"$OUTPUT_DIR/logs/aquatone.log" || true
+            2> >(_logcap "$OUTPUT_DIR/logs/aquatone.log") || true
     else
         warn "Neither gowitness nor aquatone installed"
     fi
@@ -808,7 +850,7 @@ run_gitleaks() {
     gitleaks detect --source "$download_dir" \
         --report-format json \
         --report-path "$secrets_dir/gitleaks_report.json" \
-        --no-git 2>>"$OUTPUT_DIR/logs/gitleaks.log" || true
+        --no-git 2> >(_logcap "$OUTPUT_DIR/logs/gitleaks.log") || true
 
     # Also grep for common secrets inline
     grep -rEio "(api_key|apikey|api-key|secret|password|passwd|token|access_key|private_key|bearer|auth_token)\s*[=:]\s*['\"]?[A-Za-z0-9_/+=-]{20,}" \
@@ -870,7 +912,7 @@ guess_parameters() {
         info "Guessing parameters: $domain"
         local outfile="$params_dir/${domain}.txt"
         timeout 180 arjun -u "https://$domain/" -t 20 -oT "$outfile" --stable \
-            >> "$OUTPUT_DIR/logs/arjun.log" 2>&1 || true
+            > >(_logcap "$OUTPUT_DIR/logs/arjun.log") 2>&1 || true
         if [[ -s "$outfile" ]]; then
             local cnt; cnt=$(wc -l < "$outfile")
             log "  $domain: $cnt parameter(s) found"
@@ -901,7 +943,7 @@ port_scan() {
         -c "$THREADS" \
         -silent \
         -o "$ports_dir/open_ports.txt" \
-        2>>"$OUTPUT_DIR/logs/naabu.log" || true
+        2> >(_logcap "$OUTPUT_DIR/logs/naabu.log") || true
 
     local cnt; cnt=$(count_lines "$ports_dir/open_ports.txt")
     log "Open ports found: $cnt"
